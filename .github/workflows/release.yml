@@ -1,0 +1,91 @@
+name: Build DMG and release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: false
+      - name: Validate version and tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(cat VERSION)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            [[ "$GITHUB_REF_NAME" == "v$version" ]]
+          fi
+          [[ "$(uname -m)" == x86_64 ]]
+      - run: make test
+      - run: make dmg
+      - name: Verify packaged app
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(cat VERSION)
+          image="$PWD/build/Keychain-Compatibility-Layer-$version-macOS-x86_64.dmg"
+          mount="$RUNNER_TEMP/kcl-dmg"
+          mkdir -p "$mount"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount" "$image"
+          trap 'hdiutil detach "$mount"' EXIT
+          app="$mount/Keychain Compatibility Layer.app"
+          test -f "$mount/LICENSE"
+          cmp "$mount/LICENSE" "$app/Contents/Resources/LICENSE"
+          codesign --verify --deep --strict "$app"
+          [[ "$("$app/Contents/Resources/kcl" version)" == "$version" ]]
+          "$app/Contents/Resources/kcl" diagnose --self-test
+          test -z "$(find "$app" -name '*.py')"
+          (cd build && shasum -a 256 -c "$(basename "$image").sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dmg-x86_64
+          path: |
+            build/*.dmg
+            build/*.dmg.sha256
+          if-no-files-found: error
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dmg-x86_64
+          path: release
+      - name: Publish test prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'Prebuilt Intel macOS app. Open the DMG, open the app, and choose Install for This User.' \
+            'No Homebrew, Go, Python or Xcode is needed to use the app.' \
+            '' \
+            'This build is ad-hoc signed and NOT notarized. It is a test prerelease and is not Gatekeeper-approved.' \
+            'KCL supports Codex device-key compatibility and separate Secretive SSH keys.' \
+            'Create Secretive keys from the KCL menu. Signing currently prompts twice.' \
+            'The original Codex and Secretive applications are not modified.' > notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/*.dmg release/*.sha256 --clobber
+          else
+            gh release create "$TAG" release/*.dmg release/*.sha256 \
+              --verify-tag --title "Keychain Compatibility Layer $TAG" \
+              --prerelease --notes-file notes.md
+          fi
