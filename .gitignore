@@ -1,0 +1,8 @@
+/build/
+/status.json
+.DS_Store
+/compatibility/loading-report.json
+.env
+.env.*
+*.p12
+*.pfx
